@@ -675,12 +675,19 @@ class Model(nn.Module):
         talker_temperature: float = 0.9,
         chunk_size: int = 300,
         left_context_size: int = 25,
+        use_stateful_decoder: bool = False,
         **kwargs,
     ):
         if not self.has_talker:
             raise ValueError("Cannot stream audio without talker module")
         if input_ids.shape[0] != 1:
             raise NotImplementedError("Streaming does not support batched inference")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if left_context_size < 0 or left_context_size >= chunk_size:
+            raise ValueError(
+                "left_context_size must be non-negative and smaller than chunk_size"
+            )
 
         speaker_id = self.config.talker_config.speaker_id.get(speaker.lower())
         if speaker_id is None:
@@ -810,6 +817,8 @@ class Model(nn.Module):
 
         codes_list = []
         decoded_len = 0
+        pending_codes = []
+        code2wav_state = None
 
         for residual_codes in self.talker.generate_stream(
             inputs_embeds=talker_input_embed,
@@ -820,6 +829,25 @@ class Model(nn.Module):
             temperature=talker_temperature,
             top_p=talker_top_p,
         ):
+            if use_stateful_decoder:
+                pending_codes.append(residual_codes)
+                target_size = (
+                    chunk_size
+                    if code2wav_state is None
+                    else chunk_size - left_context_size
+                )
+                if len(pending_codes) < target_size:
+                    continue
+
+                codes_buffer = mx.stack(pending_codes, axis=1).transpose(0, 2, 1)
+                wav_chunk, code2wav_state = self.code2wav.stream_step(
+                    codes_buffer, code2wav_state
+                )
+                pending_codes.clear()
+                mx.eval(wav_chunk)
+                yield ("audio", wav_chunk.astype(mx.float32))
+                continue
+
             codes_list.append(residual_codes)
             if len(codes_list) >= chunk_size:
                 codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
@@ -829,6 +857,12 @@ class Model(nn.Module):
                 if wav_chunk is not None:
                     mx.eval(wav_chunk)
                     yield ("audio", wav_chunk.astype(mx.float32))
+
+        if use_stateful_decoder and pending_codes:
+            codes_buffer = mx.stack(pending_codes, axis=1).transpose(0, 2, 1)
+            wav_chunk, _ = self.code2wav.stream_step(codes_buffer, code2wav_state)
+            mx.eval(wav_chunk)
+            yield ("audio", wav_chunk.astype(mx.float32))
 
         if codes_list:
             codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)

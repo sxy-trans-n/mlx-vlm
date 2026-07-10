@@ -1,5 +1,6 @@
 import math
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8,7 +9,17 @@ from mlx.utils import tree_flatten
 
 from mlx_vlm.models.qwen3_omni_moe.config import Code2WavConfig
 
-from ..base import scaled_dot_product_attention
+from ..base import create_attention_mask, scaled_dot_product_attention
+from ..cache import KVCache
+
+
+@dataclass
+class Code2WavStreamingState:
+    """Per-stream caches used by :meth:`Code2WavModel.stream_step`."""
+
+    transformer_cache: list[KVCache]
+    upsample_cache: list[list[Any]]
+    decoder_cache: list[Any]
 
 
 class SnakeBeta(nn.Module):
@@ -98,11 +109,34 @@ class CausalConvNet(nn.Module):
         output = self.conv(hidden_state)
         return output.transpose(0, 2, 1)
 
+    def stream(
+        self, hidden_state: mx.array, cache: Optional[mx.array] = None
+    ) -> tuple[mx.array, mx.array]:
+        if self.stride != 1:
+            raise ValueError("Streaming causal convolution only supports stride=1")
+
+        context_size = self.kernel_size - 1
+        if cache is None:
+            cache = mx.zeros(
+                (hidden_state.shape[0], hidden_state.shape[1], context_size),
+                dtype=hidden_state.dtype,
+            )
+        if context_size:
+            conv_input = mx.concatenate([cache, hidden_state], axis=-1)
+            next_cache = conv_input[..., -context_size:]
+        else:
+            conv_input = hidden_state
+            next_cache = hidden_state[..., :0]
+
+        output = self.conv(conv_input.transpose(0, 2, 1))
+        return output.transpose(0, 2, 1), next_cache
+
 
 class CausalTransConvNet(nn.Module):
     def __init__(self, in_chn, out_chn, kernel_sz, stride=1):
         super().__init__()
         self.conv = nn.ConvTranspose1d(in_chn, out_chn, kernel_sz, stride=stride)
+        self.stride = stride
         pad = kernel_sz - stride
         self.left_pad = 0
         self.right_pad = pad
@@ -113,6 +147,28 @@ class CausalTransConvNet(nn.Module):
         length = hidden_state.shape[-2]
         hidden_state = hidden_state[:, self.left_pad : length - self.right_pad, :]
         return hidden_state.transpose(0, 2, 1)
+
+    def stream(
+        self, hidden_state: mx.array, cache: Optional[mx.array] = None
+    ) -> tuple[mx.array, Optional[mx.array]]:
+        output = self.conv(hidden_state.transpose(0, 2, 1)).transpose(0, 2, 1)
+        if self.right_pad == 0:
+            return output, None
+
+        has_overlap = cache is not None
+        if cache is None:
+            cache = mx.zeros(
+                (output.shape[0], output.shape[1], self.right_pad),
+                dtype=output.dtype,
+            )
+        overlap = output[..., : self.right_pad] + cache
+        if has_overlap and self.conv.bias is not None:
+            # Both independently evaluated blocks contain the bias. The
+            # overlap-add region must contain it only once.
+            overlap = overlap - self.conv.bias[None, :, None]
+        output = mx.concatenate([overlap, output[..., self.right_pad :]], axis=-1)
+        emit_length = hidden_state.shape[-1] * self.stride
+        return output[..., :emit_length], output[..., emit_length:]
 
 
 class ConvNeXtBlock(nn.Module):
@@ -138,6 +194,20 @@ class ConvNeXtBlock(nn.Module):
         hidden_states = input + hidden_states
         return hidden_states
 
+    def stream(
+        self, hidden_states: mx.array, cache: Optional[mx.array] = None
+    ) -> tuple[mx.array, mx.array]:
+        residual = hidden_states
+        hidden_states, cache = self.dwconv.stream(hidden_states, cache)
+        hidden_states = hidden_states.transpose(0, 2, 1)
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.pwconv1(hidden_states)
+        hidden_states = nn.gelu(hidden_states)
+        hidden_states = self.pwconv2(hidden_states)
+        hidden_states = self.gamma * hidden_states
+        hidden_states = hidden_states.transpose(0, 2, 1)
+        return residual + hidden_states, cache
+
 
 class Code2WavDecoderResUnit(nn.Module):
     def __init__(self, dim: int, dilation: int = 1):
@@ -155,6 +225,15 @@ class Code2WavDecoderResUnit(nn.Module):
         hidden_state = self.act2(hidden_state)
         hidden_state = self.conv2(hidden_state)
         return hidden_state + residual
+
+    def stream(self, hidden_state: mx.array, cache=None):
+        conv1_cache, conv2_cache = cache or (None, None)
+        residual = hidden_state
+        hidden_state = self.act1(hidden_state)
+        hidden_state, conv1_cache = self.conv1.stream(hidden_state, conv1_cache)
+        hidden_state = self.act2(hidden_state)
+        hidden_state, conv2_cache = self.conv2.stream(hidden_state, conv2_cache)
+        return hidden_state + residual, (conv1_cache, conv2_cache)
 
 
 class Code2WavDecoderBlock(nn.Module):
@@ -177,6 +256,18 @@ class Code2WavDecoderBlock(nn.Module):
         for block in self.block:
             hidden = block(hidden)
         return hidden
+
+    def stream(self, hidden: mx.array, cache=None):
+        cache = cache or [None] * len(self.block)
+        next_cache = []
+        for block, block_cache in zip(self.block, cache):
+            if hasattr(block, "stream"):
+                hidden, block_cache = block.stream(hidden, block_cache)
+            else:
+                hidden = block(hidden)
+                block_cache = None
+            next_cache.append(block_cache)
+        return hidden, next_cache
 
 
 def rotate_half(x):
@@ -240,6 +331,7 @@ class Code2WavAttention(nn.Module):
         position_embeddings: Optional[Tuple[mx.array, mx.array]] = None,
         attention_mask: Optional[mx.array] = None,
         position_ids: Optional[mx.array] = None,
+        cache: Optional[KVCache] = None,
     ) -> Tuple[mx.array, Optional[mx.array]]:
         B, L, D = hidden_states.shape
         hidden_shape = (B, L, -1, self.head_dim)
@@ -266,6 +358,9 @@ class Code2WavAttention(nn.Module):
             query_states, key_states, cos, sin
         )
 
+        if cache is not None:
+            key_states, value_states = cache.update_and_fetch(key_states, value_states)
+
         if attention_mask is not None and isinstance(attention_mask, mx.array):
             kv_seq_len = key_states.shape[-2]
             if attention_mask.shape[-1] != kv_seq_len:
@@ -279,7 +374,7 @@ class Code2WavAttention(nn.Module):
             query_states,
             key_states,
             value_states,
-            None,
+            cache,
             scale=self.scaling,
             mask=attention_mask,
         )
@@ -332,6 +427,7 @@ class Code2WavTransformerLayer(nn.Module):
         attention_mask: Optional[mx.array] = None,
         position_ids: Optional[mx.array] = None,
         position_embeddings: Optional[Tuple[mx.array, mx.array]] = None,
+        cache: Optional[KVCache] = None,
     ) -> mx.array:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -340,6 +436,7 @@ class Code2WavTransformerLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
+            cache=cache,
         )
         hidden_states = residual + self.self_attn_layer_scale(hidden_states)
 
@@ -367,21 +464,28 @@ class Code2WavTransformerModel(nn.Module):
         inputs_embeds: mx.array,
         attention_mask: Optional[mx.array] = None,
         position_ids: Optional[mx.array] = None,
+        cache: Optional[list[KVCache]] = None,
     ) -> mx.array:
         hidden_states = inputs_embeds
 
         if position_ids is None:
-            position_ids = mx.arange(hidden_states.shape[1])
+            offset = cache[0].offset if cache else 0
+            position_ids = mx.arange(offset, offset + hidden_states.shape[1])
             position_ids = mx.expand_dims(position_ids, axis=0)
+
+        if attention_mask is None and cache is not None:
+            attention_mask = create_attention_mask(hidden_states, cache[0])
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for layer in self.layers:
+        layer_caches = cache if cache is not None else [None] * len(self.layers)
+        for layer, layer_cache in zip(self.layers, layer_caches):
             hidden_states = layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
+                cache=layer_cache,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -434,6 +538,9 @@ class Code2WavModel(nn.Module):
             raise ValueError("Must provide codes or input_embeds")
 
         hidden = self.pre_transformer(inputs_embeds=hidden)
+        return self._decode_hidden(hidden)
+
+    def _decode_hidden(self, hidden: mx.array) -> mx.array:
         hidden = hidden.transpose(0, 2, 1)
         for blocks in self.upsample:
             for block in blocks:
@@ -442,6 +549,74 @@ class Code2WavModel(nn.Module):
         for block in self.decoder:
             wav = block(wav)
         return mx.clip(wav, -1, 1)
+
+    def make_streaming_state(self) -> Code2WavStreamingState:
+        """Create an empty state for incremental codec-to-waveform decoding."""
+
+        return Code2WavStreamingState(
+            transformer_cache=[KVCache() for _ in self.pre_transformer.layers],
+            upsample_cache=[[None] * len(blocks) for blocks in self.upsample],
+            decoder_cache=[None] * len(self.decoder),
+        )
+
+    def _validate_streaming_state(self, state: Code2WavStreamingState) -> None:
+        if len(state.transformer_cache) != len(self.pre_transformer.layers):
+            raise ValueError("Streaming state has an incompatible transformer cache")
+        if len(state.upsample_cache) != len(self.upsample) or any(
+            len(cache) != len(blocks)
+            for cache, blocks in zip(state.upsample_cache, self.upsample)
+        ):
+            raise ValueError("Streaming state has an incompatible upsample cache")
+        if len(state.decoder_cache) != len(self.decoder):
+            raise ValueError("Streaming state has an incompatible decoder cache")
+
+        offsets = {cache.offset for cache in state.transformer_cache}
+        if len(offsets) > 1:
+            raise ValueError("Streaming state transformer cache offsets do not match")
+
+    def stream_step(
+        self,
+        codes: mx.array,
+        state: Optional[Code2WavStreamingState] = None,
+    ) -> tuple[mx.array, Code2WavStreamingState]:
+        """Decode new codec frames and return their waveform and updated state.
+
+        ``codes`` contains only frames not passed in previous calls. The state is
+        request-local and must not be reused for a different audio stream.
+        """
+
+        if codes.ndim != 3:
+            raise ValueError(f"Expected codes with shape [B, Q, T], got {codes.shape}")
+        if codes.shape[1] != self.config.num_quantizers:
+            raise ValueError(
+                f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}"
+            )
+        if codes.shape[2] == 0:
+            raise ValueError("Expected at least one codec frame")
+        if state is None:
+            state = self.make_streaming_state()
+        self._validate_streaming_state(state)
+
+        hidden = self.code_embedding(codes + mx.array(self.code_offset)).mean(1)
+        hidden = self.pre_transformer(
+            inputs_embeds=hidden, cache=state.transformer_cache
+        ).transpose(0, 2, 1)
+
+        for block_index, blocks in enumerate(self.upsample):
+            for layer_index, block in enumerate(blocks):
+                hidden, state.upsample_cache[block_index][layer_index] = block.stream(
+                    hidden, state.upsample_cache[block_index][layer_index]
+                )
+
+        for layer_index, block in enumerate(self.decoder):
+            if hasattr(block, "stream"):
+                hidden, state.decoder_cache[layer_index] = block.stream(
+                    hidden, state.decoder_cache[layer_index]
+                )
+            else:
+                hidden = block(hidden)
+
+        return mx.clip(hidden, -1, 1), state
 
     def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
         total_upsample_factor = 1

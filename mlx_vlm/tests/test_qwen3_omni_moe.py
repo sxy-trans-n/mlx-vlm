@@ -2,6 +2,7 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_vlm.models.qwen3_omni_moe.code2wav import CausalTransConvNet
 from mlx_vlm.models.qwen3_omni_moe.config import (
     AudioConfig,
     Code2WavConfig,
@@ -36,7 +37,7 @@ def _tiny_text_config(model_type="qwen3_omni_moe_text_encoder"):
     )
 
 
-def _tiny_model():
+def _tiny_model(enable_audio_output=False):
     text_config = _tiny_text_config()
     thinker_config = ThinkerConfig(
         text_config=text_config,
@@ -103,7 +104,7 @@ def _tiny_model():
             thinker_config=thinker_config,
             talker_config=talker_config,
             code2wav_config=code2wav_config,
-            enable_audio_output=False,
+            enable_audio_output=enable_audio_output,
             im_start_token_id=10,
             im_end_token_id=11,
             system_token_id=12,
@@ -126,7 +127,7 @@ class Qwen3OmniMoeTest(unittest.TestCase):
                 input_ids,
                 target_layer_idx=0,
                 thinker_max_new_tokens=3,
-                thinker_eos_token_id=63,
+                thinker_eos_token_id=1_000,
             )
         )
         expected_hidden_states, expected_input_embeds = (
@@ -160,6 +161,78 @@ class Qwen3OmniMoeTest(unittest.TestCase):
                     atol=1e-6,
                 ).item()
             )
+        )
+
+    def test_code2wav_frame_stream_matches_full_decode(self):
+        model = _tiny_model(enable_audio_output=True)
+        codes = mx.array(
+            [
+                [
+                    [0, 1, 2, 3, 4, 5],
+                    [1, 2, 3, 4, 5, 6],
+                ]
+            ],
+            dtype=mx.int32,
+        )
+
+        expected = model.code2wav(codes=codes)
+        state = None
+        chunks = []
+        for index in range(codes.shape[-1]):
+            chunk, state = model.code2wav.stream_step(
+                codes[..., index : index + 1], state
+            )
+            chunks.append(chunk)
+        actual = mx.concatenate(chunks, axis=-1)
+        mx.eval(expected, actual)
+
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(
+            bool(mx.allclose(actual, expected, rtol=1e-4, atol=1e-4).item())
+        )
+
+    def test_code2wav_stream_validates_code_shape(self):
+        model = _tiny_model(enable_audio_output=True)
+
+        with self.assertRaises(ValueError):
+            model.code2wav.stream_step(mx.zeros((1, 2), dtype=mx.int32))
+        with self.assertRaises(ValueError):
+            model.code2wav.stream_step(mx.zeros((1, 1, 2), dtype=mx.int32))
+        with self.assertRaises(ValueError):
+            model.code2wav.stream_step(mx.zeros((1, 2, 0), dtype=mx.int32))
+
+        state = model.code2wav.make_streaming_state()
+        state.decoder_cache.pop()
+        with self.assertRaises(ValueError):
+            model.code2wav.stream_step(mx.zeros((1, 2, 1), dtype=mx.int32), state)
+
+    def test_generate_stream_validates_window_sizes(self):
+        model = _tiny_model(enable_audio_output=True)
+        input_ids = mx.array([[10, 13, 20, 11, 10, 14]], dtype=mx.int32)
+
+        with self.assertRaises(ValueError):
+            next(model.generate_stream(input_ids, chunk_size=0))
+        with self.assertRaises(ValueError):
+            next(model.generate_stream(input_ids, chunk_size=4, left_context_size=4))
+        with self.assertRaises(ValueError):
+            next(model.generate_stream(input_ids, chunk_size=4, left_context_size=-1))
+
+    def test_causal_transposed_conv_stream_handles_overlap_bias(self):
+        layer = CausalTransConvNet(2, 3, kernel_sz=4, stride=2)
+        layer.conv.bias = mx.array([0.25, -0.5, 0.75])
+        hidden = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8) / 16
+
+        expected = layer(hidden)
+        cache = None
+        chunks = []
+        for index in range(hidden.shape[-1]):
+            chunk, cache = layer.stream(hidden[..., index : index + 1], cache)
+            chunks.append(chunk)
+        actual = mx.concatenate(chunks, axis=-1)
+        mx.eval(expected, actual)
+
+        self.assertTrue(
+            bool(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item())
         )
 
 
